@@ -2,10 +2,13 @@ package com.easytest.perf;
 
 import static com.google.common.base.Charsets.UTF_8;
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Predicates.not;
 import static com.google.common.collect.Iterables.concat;
 import static com.google.common.collect.Iterables.contains;
 import static com.google.common.collect.Iterables.getOnlyElement;
+import static com.google.common.base.Predicates.*;
+import static com.google.common.collect.Iterables.filter;
 import static org.jclouds.aws.ec2.reference.AWSEC2Constants.PROPERTY_EC2_AMI_QUERY;
 import static org.jclouds.aws.ec2.reference.AWSEC2Constants.PROPERTY_EC2_CC_AMI_QUERY;
 import static org.jclouds.compute.config.ComputeServiceProperties.TIMEOUT_SCRIPT_COMPLETE;
@@ -20,6 +23,10 @@ import static org.jclouds.scriptbuilder.domain.Statements.exec;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Properties;
@@ -35,6 +42,8 @@ import org.jclouds.compute.RunNodesException;
 import org.jclouds.compute.RunScriptOnNodesException;
 import org.jclouds.compute.domain.ExecResponse;
 import org.jclouds.compute.domain.NodeMetadata;
+import org.jclouds.compute.domain.NodeMetadata.Status;
+import org.jclouds.compute.domain.Template;
 import org.jclouds.compute.domain.TemplateBuilder;
 import org.jclouds.domain.LoginCredentials;
 import org.jclouds.ec2.domain.InstanceType;
@@ -44,13 +53,19 @@ import org.jclouds.providers.ProviderMetadata;
 import org.jclouds.providers.Providers;
 import org.jclouds.scriptbuilder.domain.Statement;
 import org.jclouds.scriptbuilder.statements.login.AdminAccess;
+import org.jclouds.scriptbuilder.statements.login.AdminAccessBuilderSpec;
 import org.jclouds.scriptbuilder.statements.login.UserAdd;
 import org.jclouds.sshj.config.SshjSshClientModule;
 
 import com.google.common.base.Charsets;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.io.Files;
 import com.google.inject.Module;
@@ -64,8 +79,12 @@ import org.jclouds.compute.functions.Sha512Crypt;
 public class Demo {
 
    public static enum Action {
-      ADD, RUN, EXEC, TURNON, TURNOFF, DESTROY, LISTIMAGES, LISTNODES;
-   }
+      ADD, RUN, EXEC, TURNON, TURNOFF, DESTROY, LISTIMAGES, LISTNODES, GROUPNODES
+    }
+   
+   public static enum LoginType {
+	   KEY, PASSWORD;
+	}
    
    public static final Map<String, ApiMetadata> allApis = Maps.uniqueIndex(Apis.viewableAs(ComputeServiceContext.class),
         Apis.idFunction());
@@ -75,7 +94,7 @@ public class Demo {
    
    public static final Set<String> allKeys = ImmutableSet.copyOf(Iterables.concat(appProviders.keySet(), allApis.keySet()));
    
-   public static int PARAMETERS = 5;
+   public static int PARAMETERS = 4;
    public static String INVALID_SYNTAX = "Invalid number of parameters. Syntax is: provider identity credential groupName (add|exec|run|destroy)";
 
    public static void main(String[] args) {
@@ -85,34 +104,33 @@ public class Demo {
       String provider = args[0];
       String identity = args[1];
       String credential = args[2];
-      String groupName = args[3];
-      Action action = Action.valueOf(args[4].toUpperCase());
+      String groupName = generateUniqueGroupName();
+      Action action = Action.valueOf(args[3].toUpperCase());
       boolean providerIsGCE = provider.equalsIgnoreCase("google-compute-engine");
-
-      if (action == Action.EXEC && args.length < PARAMETERS + 1)
-         throw new IllegalArgumentException("please quote the command to exec as the last parameter");
-      String command = (action == Action.EXEC) ? args[5] : "echo hello";
 
       // For GCE, the credential parameter is the path to the private key file
       if (providerIsGCE)
          credential = getPrivateKeyFromFile(credential);
 
-      if (action == Action.RUN && args.length < PARAMETERS + 1)
+      if ((action == Action.RUN || action == Action.TURNOFF || action == Action.TURNON) && args.length < PARAMETERS + 1)
          throw new IllegalArgumentException("please pass the local file to run as the last parameter");
+      
       File file = null;
       if (action == Action.RUN || action == Action.TURNOFF || action == Action.TURNON) {
-         file = new File(args[5]);
-         if (!file.exists())
+         file = new File(args[4]);
+         if (!file.exists()){
             throw new IllegalArgumentException("file must exist! " + file);
-      }
+         	}
+      	}
       
       String minRam = System.getProperty("minRam");
       String loginUser = System.getProperty("loginUser", "toor");
       
       // note that you can check if a provider is present ahead of time
       checkArgument(contains(allKeys, provider), "provider %s not in supported list: %s", provider, allKeys);
+      
+      LoginCredentials login =  (action != Action.DESTROY) ? getLoginViaKeyForCommandExecution2() : null;
 
-      LoginCredentials login = (action != Action.DESTROY) ? getLoginForCommandExecution(action) : null;
 
       ComputeService compute = initComputeService(provider, identity, credential);
 
@@ -125,30 +143,40 @@ public class Demo {
             // that tested to work with java, which tends to be Ubuntu or CentOS
             TemplateBuilder templateBuilder = compute.templateBuilder().locationId("ap-southeast-1").hardwareId(InstanceType.M1_MEDIUM);
 
-            if (providerIsGCE)
+            if (providerIsGCE){
                templateBuilder.osFamily(OsFamily.CENTOS);
+            	}
             
             // If you want to up the ram and leave everything default, you can 
             // just tweak minRam
-            if (minRam != null)
+            if (minRam != null){
                templateBuilder.minRam(Integer.parseInt(minRam));
+            	}
             
-            
+            Statement bootInstructions = null;
+            Statement bootInstructionsb = null;
             // 1> Below AdminAccess.standard() solution is passed test
             // note this will create a user with the same name as you on the
             // node. ex. you can connect via ssh publicip
-            Statement bootInstructions = AdminAccess.standard();
-
+            //bootInstructions = AdminAccess.standard();
+            AdminAccessBuilderSpec spec = AdminAccessBuilderSpec.parse("adminUsername=water,"
+            		+ "adminHome=/home/water,"
+            		+ "adminPublicKeyFile=/home/water/.ssh/id_rsa.pub,"
+            		+ "adminPrivateKeyFile=/home/water/.ssh/id_rsa");//attention: public and private keys both should be provided
+            bootInstructions = AdminAccess.builder().from(spec).build();
             
             // to run commands as root, we use the runScript option in the template.
             if(provider.equalsIgnoreCase("virtualbox"))
                templateBuilder.options(overrideLoginUser(loginUser).runScript(bootInstructions));
             else
                templateBuilder.options(runScript(bootInstructions));
+            
+            Template template = templateBuilder.build();
                        
-            NodeMetadata node = getOnlyElement(compute.createNodesInGroup(groupName, 1, templateBuilder.build()));
+            NodeMetadata node = getOnlyElement(compute.createNodesInGroup(groupName, 1, template));
             System.out.printf("<< node %s: %s%n", node.getId(),
                   concat(node.getPrivateAddresses(), node.getPublicAddresses()));
+
             	/*
             * init to run docker daemon installation  
             	 */
@@ -195,8 +223,7 @@ public class Demo {
                      inGroup(groupName),
                      Files.toString(file, Charsets.UTF_8), // passing in a string with the contents of the file
                      overrideLoginCredentials(login)
-                           .runAsRoot(false)
-                           .wrapInInitScript(true) // do not display script content when from jclouds API return result
+                           .runAsRoot(false)                           
                            .nameTask("_" + file.getName().replaceAll("\\..*", ""))); // ensuring task name isn't
                                                           // the same as the file so status checking works properly
         	 		for (Entry<? extends NodeMetadata, ExecResponse> response : stopandremove.entrySet()) {
@@ -212,17 +239,18 @@ public class Demo {
         	 		break;
          case TURNON:
         	 		System.out.printf(">> turnon [%s] on group %s as %s%n", file, groupName, login.identity);
-             
+        	 		List<String> onList = Lists.newArrayList();
+        	 		onList.add("ap-southeast-1/i-e393ad2e");
              	// you can use predicates to select which nodes you wish to turn on.
-             	Set<? extends NodeMetadata> turnons = compute.resumeNodesMatching(//
-                   Predicates.<NodeMetadata> and(SUSPENDED, inGroup(groupName)));
+             	Set<? extends NodeMetadata> turnons = compute.resumeNodesMatching(
+                   Predicates.<NodeMetadata> and(SUSPENDED, inGivenList(onList)));
              	System.out.printf("<< turnon nodes %s%n", turnons);
              		/*
              	 * after nodes are turned on, to start new docker container
              		 */
              	// TODO
              	Map<? extends NodeMetadata, ExecResponse> turnonrun = compute.runScriptOnNodesMatching(//
-                     inGroup(groupName),
+             			inGivenList(onList),
                      Files.toString(file, Charsets.UTF_8), // passing in a string with the contents of the file
                      overrideLoginCredentials(login)
                            .runAsRoot(false)
@@ -256,6 +284,21 @@ public class Demo {
                System.out.println(">>>>  " + nodeData);
             }
             break;
+         case GROUPNODES:
+            Set<? extends NodeMetadata> groupNodes = compute.listNodesDetailsMatching(nodeNameStartsWith(groupName)); 
+            System.out.printf(">> No of nodes/instances %d%n", groupNodes.size());
+            List<String> runningNodeList = Lists.newArrayList();
+            List<String> stoppedNodeList = Lists.newArrayList();
+            for (NodeMetadata nodeData : groupNodes) {
+            	NodeMetadata.Status status = nodeData.getStatus();
+               if(status == Status.RUNNING){
+                   runningNodeList.add(nodeData.getId());
+               }else if(status == Status.SUSPENDED){
+                   stoppedNodeList.add(nodeData.getId());
+                  	}
+               System.out.println(">>>>  node name: " + nodeData.getId() + ", Status: " + nodeData.getStatus());
+             	}
+            break;
 		default:
 			break;
          }
@@ -263,7 +306,7 @@ public class Demo {
          System.err.println("error adding node to group " + groupName + ": " + e.getMessage());
          error = 1;
       } catch (RunScriptOnNodesException e) {
-         System.err.println("error executing " + command + " on group " + groupName + ": " + e.getMessage());
+         System.err.println("error executing command" + " on group " + groupName + ": " + e.getMessage());
          error = 1;
       } catch (Exception e) {
          System.err.println("error: " + e.getMessage());
@@ -272,6 +315,50 @@ public class Demo {
          compute.getContext().close();
          System.exit(error);
       }
+   }
+   
+   public static String generateUniqueGroupName(){
+       String groupName = "agt";
+       InetAddress localAddress = null;
+       try {
+    	   localAddress = InetAddress.getLocalHost();
+       } catch (UnknownHostException e) {
+    	   // TODO Auto-generated catch block
+    	   e.printStackTrace();
+       		}
+       	String ctrl_ip = localAddress.getHostAddress();
+       	ctrl_ip = ctrl_ip.replaceAll("\\.", "d");
+       return groupName + ctrl_ip;
+   }
+   
+   public static Predicate<ComputeMetadata> nodeNameStartsWith(final String nodeNamePrefix) {
+		checkNotNull(nodeNamePrefix, "node name prefix must be provided");
+		return new Predicate<ComputeMetadata>(){
+			@Override
+			public boolean apply(ComputeMetadata computeMetadata) {
+				String nodeName = computeMetadata.getName();				
+		   	return nodeName != null && nodeName.startsWith(nodeNamePrefix) ;
+			}
+			@Override
+			public String toString() {
+		   	return "nodeNameStartsWith(" + nodeNamePrefix + ")";
+			}
+	   };
+   }
+   
+   private static Predicate<NodeMetadata> inGivenList(final List<String> givenList) {
+       checkNotNull(givenList, "reasonable given list must be provided");
+       return new Predicate<NodeMetadata>() {
+           @Override
+           public boolean apply(NodeMetadata nodeMetadata) {
+               return givenList.contains(nodeMetadata.getId());
+           }
+
+           @Override
+           public String toString() {
+               return "inGivenList(" + givenList + ")";
+           }
+       };
    }
 
    private static String getPrivateKeyFromFile(String filename) {
@@ -313,7 +400,7 @@ public class Demo {
       return builder.buildView(ComputeServiceContext.class).getComputeService();
    }
 
-   private static LoginCredentials getLoginForCommandExecution(Action action) {
+   private static LoginCredentials getLoginViaKeyForCommandExecution() {
       try {
         String user = System.getProperty("user.name");
         String privateKey = Files.toString(
@@ -324,8 +411,19 @@ public class Demo {
          System.err.println("error reading ssh key " + e.getMessage());
          System.exit(1);
          return null;
-      }
-	  // return LoginCredentials.builder().user("agent").password("agent").build();
+      }	  
    }
-
+   
+   private static LoginCredentials getLoginViaKeyForCommandExecution2() {
+	      try {
+	        String privateKey = Files.toString(
+	            new File("/home/water/.ssh/id_rsa"), UTF_8);
+	        return LoginCredentials.builder().
+	            user("water").privateKey(privateKey).build();
+	      } catch (Exception e) {
+	         System.err.println("error reading ssh key " + e.getMessage());
+	         System.exit(1);
+	         return null;
+	      }	  
+	   }
 }

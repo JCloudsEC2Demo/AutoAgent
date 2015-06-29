@@ -102,7 +102,7 @@
         <configuration>
           <archive>
             <manifest>
-              <mainClass>org.jclouds.examples.compute.basics.MainApp</mainClass>
+              <mainClass>com.easytest.perf.Demo</mainClass>
             </manifest>
           </archive>
         </configuration>
